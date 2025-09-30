@@ -18,22 +18,28 @@ L'intera simulazione è implementata in **Python**, con:
 Il comportamento del veicolo è descritto da un modello **non lineare a 6 stati**:
 
 - **Stati**:  
-  \[
-  x = [X, Y, \phi, v_x, v_y, \omega]
-  \]  
-  dove:
-  - \(X, Y\): posizione globale  
-  - \(\phi\): angolo di imbardata  
-  - \(v_x, v_y\): velocità longitudinali e laterali  
-  - \(\omega\): velocità di imbardata  
+
+```math
+x = [X, Y, \phi, v_x, v_y, \omega]
+```
+
+dove:  
+- $X, Y$: posizione globale  
+- $\phi$: angolo di imbardata  
+- $v_x, v_y$: velocità longitudinali e laterali  
+- $\omega$: velocità di imbardata  
+
+---
 
 - **Input**:  
-  \[
-  u = [d, \delta]
-  \]  
-  dove:
-  - \(d\): comando di trazione  
-  - \(\delta\): angolo di sterzo  
+
+```math
+u = [d, \delta]
+```
+
+dove:  
+- $d$: comando di trazione  
+- $\delta$: angolo di sterzo  
 
 Le forze delle gomme sono modellate usando una versione semplificata della **formula di Pacejka**.
 
