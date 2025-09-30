@@ -1,7 +1,8 @@
 # trajectory_generation
 # MPC Vehicle Controller for Path Tracking
 
-Il codice qui presentato implementa un **Model Predictive Controller (MPC)** per la guida autonoma di un veicolo
+Il codice qui presentato implementa un **Model Predictive Controller (MPC)** per la guida autonoma di un veicolo.
+
 Il controllore utilizza un modello dinamico a **6 stati** e risolve un problema di ottimizzazione ad ogni passo per seguire una traiettoria di riferimento, gestendo anche vincoli fisici.
 
 L'intera simulazione è implementata in **Python**, con:
