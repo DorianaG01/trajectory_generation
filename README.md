@@ -1,4 +1,3 @@
-# trajectory_generation
 # MPC Vehicle Controller for Path Tracking
 
 Il codice qui presentato implementa un **Model Predictive Controller (MPC)** per la guida autonoma di un veicolo.
