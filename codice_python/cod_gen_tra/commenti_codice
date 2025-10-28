@@ -1,0 +1,18 @@
+# Parametri meccanici
+m : massa del veicolo (kg)
+Iz : momento d'inerzia attorno all'asse z, 
+Rappresenta la resistenza alla rotazione del veicolo (yaw) (kg x m^2)
+lf : distanza centro di massa <-> asse anteriore 
+Determina la distribuzione dei carichi e le forze di sterzo (m)
+lr : distanza centro di massa <-> asse posteriore 
+Determina il comportamento in curva e la stabilità (m)
+
+# Parametri delle gomme
+Bf, Cf, Df : coefficienti ruote anteriori 
+Determinano la forma della curva forza-laterale vs angolo di slip (Magic Formula)
+Br, Cr, Dr : coefficienti ruote posteriori 
+
+# Parametri motore / resistenze 
+
+Cm1 : coefficiente motore 1 
+Parte della coppia motrice proporzionale al comando acceleratore
