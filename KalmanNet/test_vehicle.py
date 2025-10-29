@@ -12,7 +12,7 @@ from data_loader import load_vehicle_dataset
 
 path_results = '/Users/dorianagiovarruscio/Desktop/tesi/codice python/cod_KalmanNet/KNet_Vehicle_Results'
 
-# 3. Imposta i parametri del modello 
+
 m = 6 # Dimensione Stato
 n = 5 # Dimensione Osservazione
 d = 2 # Dimensione Controllo
@@ -30,7 +30,7 @@ prior_Q = torch.eye(m)
 prior_Sigma = torch.eye(m)
 prior_S = torch.eye(n)
 
-# 4. Inizializza i modelli 
+# Inizializza i modelli 
 # Modello di sistema non lineare
 sys_model = VehicleModel(Ts, T, T_test, m1x_0, prior_Q, prior_Sigma, prior_S)
 
@@ -39,7 +39,6 @@ KalmanNet_model = KalmanNetNN()
 KalmanNet_model.NNBuild(sys_model) 
 print("Modello KalmanNet costruito.")
 
-# 5. Carica i dati
 #  Carichiamo anche train_data per calcolare i min/max
 print("Caricamento dati.")
 (train_data, _, test_data) = load_vehicle_dataset(
@@ -60,7 +59,7 @@ test_control = u_test
 print(f"Dati di test caricati: {test_input.shape[0]} sequenze.")
 
 
-print("Calcolo e impostazione dei limiti min/max...")
+print("Calcolo e impostazione dei limiti min/max")
 # Indici: 0:X, 1:Y, 2:phi, 3:vx, 4:vy, 5:omega
 x_min = x_train[:, 0, :].min().item()
 x_max = x_train[:, 0, :].max().item()
@@ -90,7 +89,7 @@ sys_model.Params["omega_min"] = omega_min
 sys_model.Params["omega_max"] = omega_max
 
 
-# 6. Inizializza la Pipeline ed Esegui NNTest
+# Inizializza la Pipeline ed esegui NNTest
 print("Inizializzazione Pipeline.")
 KalmanNet_Pipeline = Pipeline_EKF("TestTime", path_results, "KalmanNet_Vehicle")
 KalmanNet_Pipeline.setssModel(sys_model)
@@ -110,15 +109,12 @@ print(f"Esecuzione NNTest sul modello: {path_results + 'best_model.pt'}")
                              test_control, 
                              path_results)
 
-print("----------------------------------------------------")
 print(f"TEST COMPLETATO. MSE MEDIO: {MSE_test_dB_avg:.2f} dB")
-print("----------------------------------------------------")
 
+# Plotting 
+print("Plotting di una traiettoria di esempio")
 
-# 7. Plotting 
-print("Plotting di una traiettoria di esempio...")
-
-# Scegli una traiettoria a caso da plottare
+# Sceglie una traiettoria a caso da plottare
 idx_to_plot = random.randint(0, test_input.shape[0] - 1) 
 
 fig, axs = plt.subplots(3, 2, figsize=(15, 12)) # 3x2 per 6 stati
