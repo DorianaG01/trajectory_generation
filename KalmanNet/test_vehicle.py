@@ -12,14 +12,13 @@ from data_loader import load_vehicle_dataset
 
 path_results = '/Users/dorianagiovarruscio/Desktop/tesi/codice python/cod_KalmanNet/KNet_Vehicle_Results'
 
-
 m = 6 # Dimensione Stato
 n = 5 # Dimensione Osservazione
 d = 2 # Dimensione Controllo
 
 Ts = 0.02 
-T = 600   # Serve per caricare i dati correttamente
-T_test = 600 # Lunghezza sequenze di test
+T = 600  
+T_test = 600 
 
 noisy_csv = '/Users/dorianagiovarruscio/Desktop/tesi/codice python/cod_KalmanNet/piecewise_mpc_noisy.csv'  
 clean_csv = '/Users/dorianagiovarruscio/Desktop/tesi/codice python/cod_KalmanNet/piecewise_mpc_clean.csv'
@@ -30,8 +29,6 @@ prior_Q = torch.eye(m)
 prior_Sigma = torch.eye(m)
 prior_S = torch.eye(n)
 
-# Inizializza i modelli 
-# Modello di sistema non lineare
 sys_model = VehicleModel(Ts, T, T_test, m1x_0, prior_Q, prior_Sigma, prior_S)
 
 # Modello KalmanNet
@@ -39,17 +36,15 @@ KalmanNet_model = KalmanNetNN()
 KalmanNet_model.NNBuild(sys_model) 
 print("Modello KalmanNet costruito.")
 
-#  Carichiamo anche train_data per calcolare i min/max
 print("Caricamento dati.")
 (train_data, _, test_data) = load_vehicle_dataset(
     noisy_csv, 
     clean_csv, 
-    T_steps=T, # Carica con la lunghezza T usata per il training
+    T_steps=T, 
     train_split=0.7, 
     val_split=0.15   
 )
 
-# Estrai i dati di training (solo per min/max) e di test
 _, _, x_train = train_data
 y_test, u_test, x_test = test_data
 
@@ -89,18 +84,13 @@ sys_model.Params["omega_min"] = omega_min
 sys_model.Params["omega_max"] = omega_max
 
 
-# Inizializza la Pipeline ed esegui NNTest
-print("Inizializzazione Pipeline.")
 KalmanNet_Pipeline = Pipeline_EKF("TestTime", path_results, "KalmanNet_Vehicle")
 KalmanNet_Pipeline.setssModel(sys_model)
 KalmanNet_Pipeline.setModel(KalmanNet_model)
 
-# Dobbiamo chiamare setTrainingParams anche se stiamo testando
-# per inizializzare l'ottimizzatore (richiesto da NNTest)
 KalmanNet_Pipeline.setTrainingParams(n_steps=1, n_batch=1, lr=1e-5, wd=1e-5, alpha=0.5)
 
 print(f"Esecuzione NNTest sul modello: {path_results + 'best_model.pt'}")
-# Assicurati che il tuo 'best_model.pt' (quello da -5dB) sia in quella cartella!
 [MSE_test_linear_arr, MSE_test_linear_avg, MSE_test_dB_avg, 
  x_out_test, t, KalmanGainKN, MSESingleTrajectory] = \
     KalmanNet_Pipeline.NNTest(sys_model, 
@@ -111,10 +101,9 @@ print(f"Esecuzione NNTest sul modello: {path_results + 'best_model.pt'}")
 
 print(f"TEST COMPLETATO. MSE MEDIO: {MSE_test_dB_avg:.2f} dB")
 
-# Plotting 
+
 print("Plotting di una traiettoria di esempio")
 
-# Sceglie una traiettoria a caso da plottare
 idx_to_plot = random.randint(0, test_input.shape[0] - 1) 
 
 fig, axs = plt.subplots(3, 2, figsize=(15, 12)) # 3x2 per 6 stati
