@@ -1,10 +1,15 @@
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation, FFMpegWriter, PillowWriter
 from dataclasses import dataclass
 from typing import Tuple, Dict, List
+import os
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation, PillowWriter
 
+# -----------------------------
+#  PARAMETRI DEL MODELLO
+# -----------------------------
 Params = {
     "Cm1": 0.287, "Cm2": 0.0545, "Cr0": 0.0518, "Cr2": 0.00035,
     "Br": 3.3852, "Cr": 1.2691, "Dr": 0.1737, "Bf": 2.579,
@@ -12,6 +17,31 @@ Params = {
     "lf": 0.029, "lr": 0.033, "g": 9.81, "maxAlpha": 0.6, "vx_zero": 0.3,
 }
 
+@dataclass
+class ControlRules:
+    """Regole morbide con rumore contenuto (stabilità yaw)."""
+    v_turn_max: float = 1.2
+    v_high: float = 4.0
+    d_range: Tuple[float, float] = (0.0, 0.33)
+    delta_turn_range: Tuple[float, float] = (0.015, 0.04)
+    delta_straight_noise: float = 0.004
+    d_noise_std: float = 0.008          
+    delta_noise_std: float = 0.002      
+    meas_noise_std: Dict[str, float] = None
+    def __post_init__(self):
+        if self.meas_noise_std is None:
+            self.meas_noise_std = {
+    "X":    0.05,   # 5 mm
+    "Y":    0.05,   # 5 mm
+    "phi":  0.003,   # ≈ 0.17° 
+    "vx":   0.010,   # 1 cm/s
+    "vy":   0.003,   # 3 mm/s
+    "omega":0.030,   # ≈ 1.7°/s
+}
+
+# -----------------------------
+#  MODELLO VEICOLO
+# -----------------------------
 def clamp(x, lo, hi):
     return np.minimum(np.maximum(x, lo), hi)
 
@@ -21,6 +51,7 @@ def tire_forces(x, u, p):
     alpha_f = -np.arctan2(omega * p["lf"] + vy, vx_eff) + delta
     alpha_r =  np.arctan2(omega * p["lr"] - vy, vx_eff)
     alpha_f = clamp(alpha_f, -p["maxAlpha"], p["maxAlpha"])
+    alpha_r = clamp(alpha_r, -p["maxAlpha"], p["maxAlpha"])
     Fy_f = p["Df"] * np.sin(p["Cf"] * np.arctan(p["Bf"] * alpha_f))
     Fy_r = p["Dr"] * np.sin(p["Cr"] * np.arctan(p["Br"] * alpha_r))
     Frx = (p["Cm1"] - p["Cm2"] * vx_eff) * d - p["Cr0"] - p["Cr2"] * (vx_eff**2)
@@ -41,19 +72,6 @@ def f_cont(x, u, p):
 def euler_step(x, u, p, Ts):
     return x + Ts * f_cont(x, u, p)
 
-@dataclass
-class ControlRules:
-    v_turn_max: float = 1.0
-    v_high: float = 4.0
-    d_range: Tuple[float, float] = (-1.0, 1.0)
-    delta_turn_range: Tuple[float, float] = (0.02, 0.05)
-    delta_straight_noise: float = 0.01
-    d_noise_std: float = 0.03
-    delta_noise_std: float = 0.01
-    meas_noise_std: Dict[str, float] = None
-    def __post_init__(self):
-        if self.meas_noise_std is None:
-            self.meas_noise_std = {"X": 0.002, "Y": 0.002, "phi": 0.001, "vx": 0.001, "vy": 0.01, "omega": 0.02}
 
 def sample_controls_piecewise(sim_steps, Ts, x0, p, rules: ControlRules, seed=42):
     prev_delta_cmd, delta_rate_max = 0.0, 0.30
@@ -62,8 +80,15 @@ def sample_controls_piecewise(sim_steps, Ts, x0, p, rules: ControlRules, seed=42
     x_shadow = np.array(x0, dtype=float)
     v_floor, d_boost_min = 0.35, 0.15
     i = 0
+    prev_mode = "init"
     while i < sim_steps:
-        mode = rng.choice(["accelerate", "cruise", "turn_left", "turn_right"], p=[0.35, 0.35, 0.15, 0.15])
+        if prev_mode in ("turn_left", "turn_right"):
+            # Se abbiamo appena finito una curva, FORZA un segmento dritto
+            mode = rng.choice(["accelerate", "cruise"], p=[0.5, 0.5])
+        else:
+            # Se eravamo dritti, possiamo scegliere qualsiasi cosa
+            mode = rng.choice(["accelerate", "cruise", "turn_left", "turn_right"], 
+                              p=[0.35, 0.35, 0.15, 0.15])
         seg_len = max(1, int(np.round(rng.uniform(0.4, 1.5) / Ts)))
         v = np.hypot(x_shadow[3], x_shadow[4])
         if mode == "accelerate":
@@ -86,8 +111,8 @@ def sample_controls_piecewise(sim_steps, Ts, x0, p, rules: ControlRules, seed=42
             if i >= sim_steps: break
             v = np.hypot(x_shadow[3], x_shadow[4])
             if v < v_floor: d = max(d, d_boost_min)
-            d_k = float(np.clip(d + rng.normal(0, rules.d_noise_std), *rules.d_range))
-            delta_k = float(np.clip(delta + rng.normal(0, rules.delta_noise_std), -0.6, 0.6))
+            d_k = float(np.clip(d, *rules.d_range))
+            delta_k = float(np.clip(delta, -0.6, 0.6))
             max_step = delta_rate_max * Ts
             delta_k = float(np.clip(delta_k, prev_delta_cmd - max_step, prev_delta_cmd + max_step))
             prev_delta_cmd = delta_k
@@ -97,51 +122,70 @@ def sample_controls_piecewise(sim_steps, Ts, x0, p, rules: ControlRules, seed=42
             x_shadow[3] = max(x_shadow[3], 0.0)
             x_shadow[5] = float(np.clip(x_shadow[5], -6, 6))
             i += 1
+        prev_mode = mode
     return U_sim, modes
 
 
-def generate_dataset(num_traj, T, Ts, seed=2025):
+def generate_dataset(num_traj, T, Ts, seed=2025, smooth_states_for_plots=True):
     rules = ControlRules()
     rng = np.random.default_rng(seed)
     sim_steps_per_traj = int(np.round(T / Ts))
     all_trajectories_data: List[pd.DataFrame] = []
 
-    for i in range(num_traj):
-        x0 = np.array([rng.uniform(-2,2), rng.uniform(-2,2), rng.uniform(-np.pi,np.pi), rng.uniform(0.2,0.6), rng.uniform(-0.05,0.05), rng.uniform(-1,1)], dtype=float)
+    print(f"Inizio generazione di {num_traj} traiettorie...")
+    for i in tqdm(range(num_traj), desc="Generando Traiettorie"):
+        x0 = np.array([
+            rng.uniform(-2, 2), rng.uniform(-2, 2), rng.uniform(-np.pi, np.pi),
+            rng.uniform(0.2, 0.6), rng.uniform(-0.05, 0.05), rng.uniform(-1, 1)
+        ], dtype=float)
+
         U_sim, modes = sample_controls_piecewise(sim_steps_per_traj, Ts, x0, Params, rules, seed=seed+i)
 
-        history_X = np.empty((sim_steps_per_traj + 1, 6))
-        history_X[0, :] = x0
+        # integrazione modello fisico
+        history_X_truth = np.empty((sim_steps_per_traj + 1, 6))
+        history_X_truth[0, :] = x0
         for k in range(sim_steps_per_traj):
-            x_dot = f_cont(history_X[k, :], U_sim[k, :], Params)
-            history_X[k+1, :] = history_X[k, :] + Ts*x_dot
-            history_X[k+1, 3] = max(history_X[k+1, 3], 0.0)
-            history_X[k+1, 5] = float(np.clip(history_X[k+1, 5], -6, 6))
+            x_dot = f_cont(history_X_truth[k, :], U_sim[k, :], Params)
+            history_X_truth[k+1, :] = history_X_truth[k, :] + Ts*x_dot
+            history_X_truth[k+1, 3] = max(history_X_truth[k+1, 3], 0.0)
+            history_X_truth[k+1, 5] = float(np.clip(history_X_truth[k+1, 5], -6, 6))
 
-    
+       
+        # misure rumorose
         N = sim_steps_per_traj + 1
         noise_rng = np.random.default_rng(12345 + i)
         noise = np.column_stack([
-            noise_rng.normal(0, rules.meas_noise_std["X"], N), noise_rng.normal(0, rules.meas_noise_std["Y"], N),
-            noise_rng.normal(0, rules.meas_noise_std["phi"], N), noise_rng.normal(0, rules.meas_noise_std["vx"], N),
-            noise_rng.normal(0, rules.meas_noise_std["vy"], N), noise_rng.normal(0, rules.meas_noise_std["omega"], N),
+            noise_rng.normal(0, rules.meas_noise_std["X"], N),
+            noise_rng.normal(0, rules.meas_noise_std["Y"], N),
+            noise_rng.normal(0, rules.meas_noise_std["phi"], N),
+            noise_rng.normal(0, rules.meas_noise_std["vx"], N),
+            noise_rng.normal(0, rules.meas_noise_std["vy"], N),
+            noise_rng.normal(0, rules.meas_noise_std["omega"], N),
         ])
-        history_X_meas = history_X + noise
+        history_X_meas = history_X_truth + noise
 
-        for noise_type, state_history in [('clean', history_X), ('noisy', history_X_meas)]:
-            traj_df = pd.DataFrame({
-                't': np.arange(N) * Ts,
-                'X': state_history[:, 0], 'Y': state_history[:, 1], 
-                'vx': state_history[:, 3], 'vy': state_history[:, 4], 'omega': state_history[:, 5], 
-                'd': np.append(U_sim[:, 0], np.nan), 'delta': np.append(U_sim[:, 1], np.nan),
-                'trajectory_id': i, 'noise_type': noise_type, 'mode':modes + [""]
-            })
+        t_steps = np.arange(N) * Ts
+        modes_full = modes + [""]
+
+        for noise_type, state_history in [('clean', history_X_truth), ('noisy', history_X_meas)]:
+            data = {
+                't': t_steps,
+                'X': state_history[:, 0], 'Y': state_history[:, 1],'phi': state_history[:, 2],
+                'vx': state_history[:, 3], 'vy': state_history[:, 4], 'omega': state_history[:, 5],
+                'd': np.append(U_sim[:, 0], np.nan),
+                'delta': np.append(U_sim[:, 1], np.nan),
+                'trajectory_id': i, 'noise_type': noise_type, 'mode': modes_full
+            }
+            if noise_type == 'clean':
+                data['phi'] = state_history[:, 2]
+            traj_df = pd.DataFrame(data)
             all_trajectories_data.append(traj_df)
-    
-    final_dataset = pd.concat(all_trajectories_data, ignore_index=True)
-    return final_dataset
-    
-def animate_trajectories(dataset, num_to_animate=10, interval=30, save_path=None):
+
+    combined_dataset = pd.concat(all_trajectories_data, ignore_index=True, sort=False)
+    print("Generazione dataset completata.")
+    return combined_dataset
+
+def animate_trajectories(dataset, num_to_animate=10, interval=10, save_path=None):
     fig, ax = plt.subplots(figsize=(10, 8))
     title = f"Animazione di {num_to_animate} Traiettorie"
     if save_path: title += f" ({'Clean' if 'clean' in save_path else 'Noisy'})"
@@ -189,12 +233,12 @@ def animate_trajectories(dataset, num_to_animate=10, interval=30, save_path=None
 if __name__ == "__main__":
     num_traj = 5000
     duration = 12.0
-    time_step = 0.02
+    time_step = 0.01
 
-    #output_csv_clean = "vehicle_piecewise_clean.csv"
+    output_csv_clean = "vehicle_piecewise_clean.csv"
     output_csv_noisy = "vehicle_piecewise_noisy.csv"
-    #output_gif_clean = "animation_piecewise_clean.gif"
-    #output_gif_noisy = "animation_piecewise_noisy.gif"
+    output_gif_clean = "animation_piecewise_clean.gif"
+    output_gif_noisy = "animation_piecewise_noisy.gif"
 
     # 1. Genera il dataset combinato
     combined_dataset = generate_dataset(
@@ -205,21 +249,21 @@ if __name__ == "__main__":
     )
 
     # 2. Salva i dataset separati
-    #clean_dataset = combined_dataset[combined_dataset['noise_type'] == 'clean'].copy()
+    clean_dataset = combined_dataset[combined_dataset['noise_type'] == 'clean'].copy()
     noisy_dataset = combined_dataset[combined_dataset['noise_type'] == 'noisy'].copy()
     
-    #if 'noise_type' and 'mode' in clean_dataset.columns:
-        #clean_dataset = clean_dataset.drop(columns=['noise_type', 'mode'])
+    if 'noise_type' and 'mode' in clean_dataset.columns:
+        clean_dataset = clean_dataset.drop(columns=['noise_type', 'mode'])
     if 'noise_type' and 'mode' in noisy_dataset.columns:
-        noisy_dataset = noisy_dataset.drop(columns=['noise_type', 'mode'])
+        noisy_dataset = noisy_dataset.drop(columns=['noise_type', 'mode', 'phi'])
 
-    #clean_dataset.to_csv(output_csv_clean, index=False)
-    #print(f"   -> Dataset pulito salvato come '{output_csv_clean}'")
+    clean_dataset.to_csv(output_csv_clean, index=False)
+    print(f"   -> Dataset pulito salvato come '{output_csv_clean}'")
     noisy_dataset.to_csv(output_csv_noisy, index=False)
     print(f"   -> Dataset rumoroso salvato come '{output_csv_noisy}'")
     
     # 3. Visualizzazione e Animazione
-    #if not combined_dataset.empty:
+    if not combined_dataset.empty:
 
-        #animate_trajectories(clean_dataset, num_to_animate=10, save_path=output_gif_clean)
-        #animate_trajectories(noisy_dataset, num_to_animate=10, save_path=output_gif_noisy) 
+        animate_trajectories(clean_dataset, num_to_animate=10, save_path=output_gif_clean)
+        animate_trajectories(noisy_dataset, num_to_animate=10, save_path=output_gif_noisy) 

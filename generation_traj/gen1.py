@@ -4,6 +4,8 @@ import matplotlib.pyplot as plt
 from scipy.interpolate import CubicSpline
 from matplotlib.animation import FuncAnimation, PillowWriter
 from tqdm import tqdm
+from dataclasses import dataclass
+from typing import Tuple, Dict, List
 
 Params = {
     "Cm1": 0.287, "Cm2": 0.0545, "Cr0": 0.0518, "Cr2": 0.00035,
@@ -13,6 +15,22 @@ Params = {
 }
 np.random.seed(42)
 
+@dataclass
+class ControlRules:
+    """Contiene le deviazioni standard per il rumore di misura."""
+    meas_noise_std: Dict[str, float] = None
+    def __post_init__(self):
+        if self.meas_noise_std is None:
+            self.meas_noise_std = {
+    "X":    0.05,   # 5 mm
+    "Y":    0.05,   # 5 mm
+    "phi":  0.003,   # ≈ 0.17° 
+    "vx":   0.010,   # 1 cm/s
+    "vy":   0.003,   # 3 mm/s
+    "omega":0.030,   # ≈ 1.7°/s
+}
+
+ 
 def clamp(x, lo, hi):
     return np.minimum(np.maximum(x, lo), hi)
 
@@ -40,51 +58,54 @@ def f_cont(x, u, p):
     return np.array([Xdot, Ydot, phidot, vxdot, vydot, omegadot])
 
 def simulate_trajectory(x0, U_sim, time_step, p):
+    """Simula la traiettoria usando Eulero Esplicito con clipping di stabilità."""
     sim_steps = len(U_sim)
     history_X = np.empty((sim_steps + 1, 6))
     history_X[0, :] = x0
+    
     for k in range(sim_steps):
         x_dot = f_cont(history_X[k, :], U_sim[k, :], p)
         history_X[k + 1, :] = history_X[k, :] + time_step * x_dot
+        
+        # Clipping per stabilità numerica e fisica
+        history_X[k + 1, 3] = max(history_X[k + 1, 3], 0.0)
+        history_X[k + 1, 5] = float(np.clip(history_X[k + 1, 5], -6.0, 6.0))
+
     return history_X
 
 def create_spline_signal(num_steps, Ts, d_mean, d_std, delta_mean, delta_std):
-
     if num_steps <= 1: return np.array([d_mean]), np.array([delta_mean])
-
     checkpoint_interval_s = np.random.uniform(3.0, 5.0)
     checkpoint_interval_steps = max(1, int(round(checkpoint_interval_s / Ts)))
     idx = np.arange(0, num_steps, checkpoint_interval_steps)
-
     if idx[-1] != num_steps - 1: idx = np.append(idx, num_steps - 1)
     d_chk, delta_chk = np.random.normal(d_mean, d_std, len(idx)), np.random.normal(delta_mean, delta_std, len(idx))
     s_d, s_delta = CubicSpline(idx, d_chk, bc_type='natural'), CubicSpline(idx, delta_chk, bc_type='natural')
     t = np.arange(num_steps)
-
     return s_d(t), s_delta(t)
 
 def generate_smooth_profiles(total_steps, Ts, stats, mode='random'):
-
     if mode == 'random': mode = np.random.choice(['straight', 'sinusoid'], p=[0.5, 0.5])
-
     transient_duration_s = np.random.uniform(1.5, 3.0)
     transient_steps = min(int(transient_duration_s / Ts), total_steps)
     steady_state_steps = total_steps - transient_steps
-
     d_tr, delta_tr = create_spline_signal(num_steps=transient_steps, Ts=Ts, d_mean=stats['d_mean'], d_std=stats['d_std']*0.2, delta_mean=stats['delta_mean'], delta_std=stats['delta_std']*0.3)
     
     if steady_state_steps > 0:
         d_st = np.random.normal(stats['d_mean'], stats['d_std']*0.05, steady_state_steps)
         if mode == 'sinusoid':
             t_st = np.arange(steady_state_steps) * Ts
-            period, amplitude = np.random.uniform(4.0, 8.0), np.random.uniform(stats['delta_std']*1.5, stats['delta_std']*2.5)
+            period, amplitude = np.random.uniform(4.0, 8.0), np.random.uniform(stats['delta_std']*0.5, stats['delta_std']*1.5)
             phase, omega = np.random.uniform(0, 2*np.pi), 2*np.pi/period
             sinusoid, noise = amplitude*np.sin(omega*t_st + phase), np.random.normal(0, stats['delta_std']*0.1, steady_state_steps)
             delta_st = stats['delta_mean'] + sinusoid + noise
-        else: delta_st = np.random.normal(stats['delta_mean'], stats['delta_std']*0.01, steady_state_steps)
+        else: 
+            delta_st = np.random.normal(stats['delta_mean'], stats['delta_std']*0.01, steady_state_steps)
+        
         d_profile, delta_profile = np.concatenate([d_tr, d_st]), np.concatenate([delta_tr, delta_st])
-    else: d_profile, delta_profile = d_tr, delta_tr
-
+    else: 
+        d_profile, delta_profile = d_tr, delta_tr
+        
     return d_profile, delta_profile, mode
 
 def apply_du_bounds(u, du_min, du_max):
@@ -94,44 +115,88 @@ def apply_du_bounds(u, du_min, du_max):
         out[k] = out[k-1] + du
     return out
 
+def create_trajectory_dataframe(state_history, U_sim, t_steps, traj_id, noise_type, mode):
+    """Funzione helper per creare un DataFrame. Aggiunge 'phi' solo per 'clean'."""
+    
+    data = {
+        't': t_steps, 
+        'X': state_history[:, 0], 
+        'Y': state_history[:, 1], 
+        'vx': state_history[:, 3], 
+        'vy': state_history[:, 4], 
+        'omega': state_history[:, 5],
+        'd': np.append(U_sim[:, 0], np.nan), 
+        'delta': np.append(U_sim[:, 1], np.nan),
+        'trajectory_id': traj_id, 
+        'noise_type': noise_type, 
+        'mode': mode
+    }
+    
+   
+    if noise_type == 'clean':
+        data['phi'] = state_history[:, 2]
+    
+    return pd.DataFrame(data)
+
+
 def plot_sample_controls(dataset, trajectory_id):
+    """Plotta i controlli Ground Truth per una data traiettoria."""
+    
     traj_data = dataset[dataset['trajectory_id'] == trajectory_id]
-
     clean_traj = traj_data[traj_data['noise_type'] == 'clean'].copy().dropna(subset=['d', 'delta'])
-    noisy_traj = traj_data[traj_data['noise_type'] == 'noisy'].copy().dropna(subset=['d', 'delta'])
-
-    if clean_traj.empty or noisy_traj.empty:
-        print(f"Dati mancanti per la traiettoria {trajectory_id}.")
+    
+    if clean_traj.empty:
+        print(f"Dati di controllo mancanti per la traiettoria {trajectory_id}.")
         return
+        
     fig, axs = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
     mode = clean_traj['mode'].iloc[0]
-    fig.suptitle(f'Confronto Controlli - Traiettoria {trajectory_id} (Modalità: {mode})', fontsize=16)
-    axs[0].plot(clean_traj['t'], clean_traj['d'], lw=2, color='royalblue', label='Clean (Spline)')
-    axs[0].plot(noisy_traj['t'], noisy_traj['d'], lw=1, color='firebrick', alpha=0.8, label='Noisy + Limited')
+    fig.suptitle(f'Controlli Ground Truth - Traiettoria {trajectory_id} (Modalità: {mode})', fontsize=16)
+    
+    axs[0].plot(clean_traj['t'], clean_traj['d'], lw=2, color='royalblue', label='Controllo Ground Truth (d)')
     axs[0].set_ylabel('d [-]'); axs[0].grid(True, linestyle=':'); axs[0].legend()
-    axs[1].plot(clean_traj['t'], clean_traj['delta'], lw=2, color='royalblue', label='Clean (Spline)')
-    axs[1].plot(noisy_traj['t'], noisy_traj['delta'], lw=1, color='firebrick', alpha=0.8, label='Noisy + Limited')
+    
+    axs[1].plot(clean_traj['t'], clean_traj['delta'], lw=2, color='royalblue', label='Controllo Ground Truth (delta)')
     axs[1].set_ylabel('delta [rad]'); axs[1].set_xlabel('Tempo [s]'); axs[1].grid(True, linestyle=':'); axs[1].legend()
+    
     plt.tight_layout(rect=[0, 0.03, 1, 0.95]); plt.show()
     
-def animate_trajectories(dataset, num_to_animate, save_path=None):
+def animate_trajectories(dataset, num_to_animate, noise_type_to_animate='noisy', save_path=None):
+    """Anima le traiettorie per un dato tipo di rumore ('clean' o 'noisy')."""
+    
     fig, ax = plt.subplots(figsize=(10, 8))
     ax.set_aspect('equal', adjustable='box')
-    title = f'Animazione di {num_to_animate} Traiettorie'
-    if save_path: title += f" ({'Clean' if 'clean' in save_path else 'Noisy'})"
+    
+    noise_type_str_capitalized = noise_type_to_animate.capitalize()
+    title = f'Animazione di {num_to_animate} Traiettorie ({noise_type_str_capitalized})'
     ax.set_title(title, fontsize=16)
     ax.set_xlabel('Posizione X [m]'); ax.set_ylabel('Posizione Y [m]'); ax.grid(True, linestyle=':')
+    
+    anim_dataset = dataset[dataset['noise_type'] == noise_type_to_animate]
+    traj_ids = anim_dataset['trajectory_id'].unique()
+    
     trajectories_data = []
-    for i in range(min(num_to_animate, int(dataset['trajectory_id'].max()) + 1)):
-        traj = dataset[dataset['trajectory_id'] == i]
+    for i in traj_ids[:num_to_animate]:
+        traj = anim_dataset[anim_dataset['trajectory_id'] == i]
         trajectories_data.append({'x': traj['X'].values, 'y': traj['Y'].values, 't': traj['t'].values})
-    x_min, x_max = min(d['x'].min() for d in trajectories_data)-1, max(d['x'].max() for d in trajectories_data)+1
-    y_min, y_max = min(d['y'].min() for d in trajectories_data)-1, max(d['y'].max() for d in trajectories_data)+1
+    
+    if not trajectories_data:
+        print(f"Nessun dato '{noise_type_to_animate}' trovato per l'animazione.")
+        plt.close(fig)
+        return
+
+    x_min = min(d['x'].min() for d in trajectories_data) - 1
+    x_max = max(d['x'].max() for d in trajectories_data) + 1
+    y_min = min(d['y'].min() for d in trajectories_data) - 1
+    y_max = max(d['y'].max() for d in trajectories_data) + 1
     ax.set_xlim(x_min, x_max); ax.set_ylim(y_min, y_max)
-    lines = [ax.plot([], [], lw=2, label=f'Traiettoria {i}')[0] for i in range(num_to_animate)]
+    
+    lines = [ax.plot([], [], lw=2, label=f'Traiettoria {traj_ids[i]}')[0] for i in range(len(trajectories_data))]
     points = [ax.plot([], [], 'o', markersize=8, color=line.get_color())[0] for line in lines]
     time_text = ax.text(0.05, 0.95, '', transform=ax.transAxes, va='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.7))
     ax.legend(loc='best')
+
+    max_len = max(len(d['t']) for d in trajectories_data)
 
     def init():
         for line, point in zip(lines, points): line.set_data([], []); point.set_data([], [])
@@ -140,83 +205,126 @@ def animate_trajectories(dataset, num_to_animate, save_path=None):
     
     def animate(i):
         for j, data in enumerate(trajectories_data):
-            lines[j].set_data(data['x'][:i+1], data['y'][:i+1])
-            points[j].set_data([data['x'][i]], [data['y'][i]])
-        time_text.set_text(f'Tempo = {trajectories_data[0]["t"][i]:.2f} s')
+            idx = min(i, len(data['t']) - 1)
+            lines[j].set_data(data['x'][:idx+1], data['y'][:idx+1])
+            points[j].set_data([data['x'][idx]], [data['y'][idx]])
+        
+        t_now = trajectories_data[0]['t'][min(i, len(trajectories_data[0]['t']) - 1)]
+        time_text.set_text(f'Tempo = {t_now:.2f} s')
         return lines + points + [time_text]
-    ani = FuncAnimation(fig, animate, frames=len(trajectories_data[0]['t']), init_func=init, interval=30, blit=True)
+
+    ani = FuncAnimation(fig, animate, frames=max_len, init_func=init, interval=30, blit=True)
     if save_path:
         print(f"\nSalvataggio animazione in corso su '{save_path}'...")
         writer = PillowWriter(fps=int(1000/30)); ani.save(save_path, writer=writer, dpi=120)
         print("Salvataggio completato.")
     plt.show()
 
+# --- Blocco Esecuzione Principale ---
 if __name__ == "__main__":
     num_traj = 5000
     traj_duration = 12.0
-    time_step = 0.02
+    time_step = 0.01
     
-    #output_csv_clean = "vehicle_mpc_clean.csv"
-    output_csv_noisy = "vehicle_mpc_noisy.csv"
-    #output_animation_noisy = "animation_noisy.gif"
+    output_csv_clean = "vehicle_mpc_clean.csv" 
+    output_csv_noisy = "vehicle_mpc_noisy_err005.csv"
+    output_animation_noisy = "animation_smooth_noisy.gif"
 
     mpc_stats = {'d_mean': 0.2161, 'd_std': 0.1314, 'delta_mean': 0.0035, 'delta_std': 0.0338}
     du_bounds = ((-0.1, 0.1), (-0.04, 0.04))
+    
+    rules = ControlRules() 
+    noise_seed_base = 12345 
 
     all_trajectories_data = []
     sim_steps_per_traj = int(traj_duration / time_step)
     
+    x_init_range = (-2.0, 2.0)
+    y_init_range = (-2.0, 2.0)
+    phi_init_range = (-np.pi, np.pi)
+    vx_init_range = (0.4, 1.5)
+    vy_init_range = (-0.05, 0.05)
+    omega_init_range = (-1.0, 1.0)
+    
     for i in tqdm(range(num_traj), desc="Generando Traiettorie"):
 
-        v_init, phi_init, beta_init = (0.4, 1.5), (-np.pi, np.pi), (-0.2, 0.2)
-        omega_init= np.random.uniform(-1, 1)
-        v, phi, beta = np.random.uniform(*v_init), np.random.uniform(*phi_init), np.random.uniform(*beta_init)
-        vx, vy = v*np.cos(beta), v*np.sin(beta)
-        x, y = np.random.uniform(-2, 2), np.random.uniform(-2, 2)
-        
-
-        x0 = np.array([x, y, phi, vx, vy, omega_init])
+        x0 = np.array([
+            np.random.uniform(*x_init_range),
+            np.random.uniform(*y_init_range),
+            np.random.uniform(*phi_init_range),
+            np.random.uniform(*vx_init_range),
+            np.random.uniform(*vy_init_range),
+            np.random.uniform(*omega_init_range)
+        ])
 
         d_clean, delta_clean, mode = generate_smooth_profiles(sim_steps_per_traj, time_step, mpc_stats)
-        d_clean_limited = np.clip(apply_du_bounds(d_clean, *du_bounds[0]), -1.0, 1.0)
-        delta_clean_limited = np.clip(apply_du_bounds(delta_clean, *du_bounds[1]), -0.6, 0.6)
-        U_clean = np.stack([d_clean_limited, delta_clean_limited], axis=1)
-
+        
         noise_d = np.random.normal(0, mpc_stats['d_std'] * 0.1, sim_steps_per_traj)
         noise_delta = np.random.normal(0, mpc_stats['delta_std'] * 0.1, sim_steps_per_traj)
-        d_noisy = np.clip(apply_du_bounds(d_clean + noise_d, *du_bounds[0]), -1.0, 1.0)
-        delta_noisy = np.clip(apply_du_bounds(delta_clean + noise_delta, *du_bounds[1]), -0.6, 0.6)
-        U_noisy = np.stack([d_noisy, delta_noisy], axis=1)
-
-        history_X_clean = simulate_trajectory(x0, U_clean, time_step, Params)
-        history_X_noisy = simulate_trajectory(x0, U_noisy, time_step, Params)
-
-        for noise_type, history_X, U_sim in [('clean', history_X_clean, U_clean), ('noisy', history_X_noisy, U_noisy)]:
-            traj_df = pd.DataFrame({
-                't': np.arange(sim_steps_per_traj + 1) * time_step, 'X': history_X[:, 0], 'Y': history_X[:, 1], 
-                 'vx': history_X[:, 3], 'vy': history_X[:, 4], 'omega': history_X[:, 5],
-                'd': np.append(U_sim[:, 0], np.nan), 'delta': np.append(U_sim[:, 1], np.nan),
-                'trajectory_id': i, 'noise_type': noise_type, 'mode': mode
-            })
-            all_trajectories_data.append(traj_df)
-    
-    final_dataset = pd.concat(all_trajectories_data, ignore_index=True)
-    
-    #clean_dataset = final_dataset[final_dataset['noise_type'] == 'clean'].copy()
-    noisy_dataset = final_dataset[final_dataset['noise_type'] == 'noisy'].copy()
-    
-    #if 'noise_type' and 'mode' in clean_dataset.columns:
-        #clean_dataset = clean_dataset.drop(columns=['noise_type', 'mode'])
-    if 'noise_type' and 'mode' in noisy_dataset.columns:
-        noisy_dataset = noisy_dataset.drop(columns=['noise_type', 'mode'])
         
-    #clean_dataset.to_csv(output_csv_clean, index=False)
-    #print(f"   -> Dataset pulito salvato come '{output_csv_clean}'")
-    noisy_dataset.to_csv(output_csv_noisy, index=False)
-    print(f"   -> Dataset rumoroso salvato come '{output_csv_noisy}'")
+        d_true = np.clip(apply_du_bounds(d_clean + noise_d, *du_bounds[0]), -1.0, 1.0)
+        delta_true = np.clip(apply_du_bounds(delta_clean + noise_delta, *du_bounds[1]), -0.6, 0.6)
+        U_sim_true = np.stack([d_true, delta_true], axis=1)
+
+        history_X_truth = simulate_trajectory(x0, U_sim_true, time_step, Params)
+
+        N = sim_steps_per_traj + 1
+        noise_rng = np.random.default_rng(noise_seed_base + i)
+        meas_noise = np.column_stack([
+            noise_rng.normal(0, rules.meas_noise_std["X"], N),     
+            noise_rng.normal(0, rules.meas_noise_std["Y"], N),     
+            noise_rng.normal(0, rules.meas_noise_std["phi"], N),   
+            noise_rng.normal(0, rules.meas_noise_std["vx"], N),    
+            noise_rng.normal(0, rules.meas_noise_std["vy"], N),    
+            noise_rng.normal(0, rules.meas_noise_std["omega"], N), 
+        ])
+        
+        history_X_meas = history_X_truth + meas_noise
+        
+        t_steps = np.arange(N) * time_step
+        df_clean = create_trajectory_dataframe(history_X_truth, U_sim_true, t_steps, i, 'clean', mode)
+        df_noisy = create_trajectory_dataframe(history_X_meas, U_sim_true, t_steps, i, 'noisy', mode)
+        
+        all_trajectories_data.extend([df_clean, df_noisy])
+    
+    final_dataset = pd.concat(all_trajectories_data, ignore_index=True, sort=False)
+    
+
+    
+    # Salva il dataset 'clean'
+    clean_dataset_only = final_dataset[final_dataset['noise_type'] == 'clean'].copy()
+    # Droppa le colonne 'noise_type' e 'mode' che non servono nel file finale
+    cols_to_drop_clean = [col for col in ['noise_type', 'mode'] if col in clean_dataset_only.columns]
+    clean_dataset_only = clean_dataset_only.drop(columns=cols_to_drop_clean)
+    
+    # Riordina le colonne per mettere 'phi' in posizione logica
+    if 'phi' in clean_dataset_only.columns:
+        cols_order = ['t', 'X', 'Y', 'phi', 'vx', 'vy', 'omega', 'd', 'delta', 'trajectory_id']
+        # Seleziona solo le colonne che esistono
+        final_cols = [col for col in cols_order if col in clean_dataset_only.columns]
+        clean_dataset_only = clean_dataset_only[final_cols]
+        
+    clean_dataset_only.to_csv(output_csv_clean, index=False)
+    print(f"   -> Dataset 'clean' (con phi) salvato come '{output_csv_clean}'")
+
+    # Salva il dataset 'noisy'
+    noisy_dataset_only = final_dataset[final_dataset['noise_type'] == 'noisy'].copy()
+    # Droppa 'noise_type', 'mode', e la colonna 'phi' (che è piena di NaN)
+    cols_to_drop_noisy = [col for col in ['noise_type', 'mode', 'phi'] if col in noisy_dataset_only.columns]
+    noisy_dataset_only = noisy_dataset_only.drop(columns=cols_to_drop_noisy)
+        
+    noisy_dataset_only.to_csv(output_csv_noisy, index=False)
+    print(f"   -> Dataset 'noisy' (senza phi) salvato come '{output_csv_noisy}'")
+
 
     if not final_dataset.empty:
-        sinusoid_example_id = final_dataset[final_dataset['mode'] == 'sinusoid']['trajectory_id'].iloc[0]
-        plot_sample_controls(final_dataset, sinusoid_example_id)
+        try:
+            sinusoid_example_id = final_dataset[final_dataset['mode'] == 'sinusoid']['trajectory_id'].iloc[0]
+            print(f"Plotting controlli di esempio per traiettoria {sinusoid_example_id}...")
+            plot_sample_controls(final_dataset, sinusoid_example_id)
+        except IndexError:
+            print("Nessuna traiettoria 'sinusoid' trovata per il plot di esempio.")
         
-        #animate_trajectories(noisy_dataset, num_to_animate=10, save_path=output_animation_noisy)
+        animate_trajectories(final_dataset, num_to_animate=10, 
+                             noise_type_to_animate='noisy', 
+                             save_path=output_animation_noisy)

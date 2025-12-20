@@ -7,6 +7,7 @@ Params = {
     "Br": 3.3852, "Cr": 1.2691, "Dr": 0.1737, "Bf": 2.579,
     "Cf": 1.2,    "Df": 0.192, "m": 0.041, "Iz": 27.8e-6,
     "lf": 0.029, "lr": 0.033, "g": 9.81, "maxAlpha": 0.6, "vx_zero": 0.3,
+
 }
 
 # Funzioni operano su batch di tensori
