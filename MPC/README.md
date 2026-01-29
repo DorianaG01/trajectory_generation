@@ -96,10 +96,6 @@ python main.py
 Upon completion, the script will print control statistics (mean duty cycle, steering range) and generate a GIF animation of the tracking performance.
 
 ---
-## Acknowledgments
-
-This implementation is inspired by and based on the concepts found in the MPCC (Model Predictive Contouring Control) repository by Alexander Liniger.
-https://github.com/alexliniger/MPCC.git
 
 ## Experimentation Guide
 
@@ -109,5 +105,11 @@ You can modify the controller's behavior by adjusting parameters in `main.py`:
 * **Smoothing**: Increase `Rd` weights to reduce jerky steering movements.
 * **Prediction**: Change `N` to adjust the look-ahead horizon.
 * **Geometry**: Toggle the commented sections in `ref_window_from_x_with_vref` to switch between a Sine wave or a Parabola.
+
+## Acknowledgments
+
+This implementation is inspired by and based on the concepts found in the MPCC (Model Predictive Contouring Control) repository by Alexander Liniger.
+https://github.com/alexliniger/MPCC.git
+
 
 
