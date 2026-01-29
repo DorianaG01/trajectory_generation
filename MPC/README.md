@@ -1,137 +1,113 @@
 # MPC Vehicle Controller for Path Tracking
 
-Il codice qui presentato implementa un **Model Predictive Controller (MPC)** per la guida autonoma di un veicolo.
+This project implements a **Model Predictive Controller (MPC)** for the autonomous guidance of a vehicle using a **dynamic 6-state bicycle model**. The system solves a constrained optimization problem at each time step to track a reference trajectory while respecting physical limits and tire dynamics.
 
-Il controllore utilizza un modello dinamico a **6 stati** e risolve un problema di ottimizzazione ad ogni passo per seguire una traiettoria di riferimento, gestendo anche vincoli fisici.
-
-L'intera simulazione è implementata in **Python**, con:
-- `numpy` per i calcoli numerici  
-- `cvxpy` per la formulazione del problema di ottimizzazione  
-- `matplotlib` per la visualizzazione  
+The simulation environment is built in **Python** using:
+* **NumPy**: For high-performance numerical computations and matrix operations.
+* **CVXPY**: For the convex formulation and solving of the optimization problem.
+* **Matplotlib**: For real-time visualization and generating trajectory animations.
 
 ---
 
-##  Concetti Chiave
+## Key Concepts
 
-### Modello Dinamico del Veicolo
-Il comportamento del veicolo è descritto da un modello **non lineare a 6 stati**:
+### Dynamic Vehicle Model
+The vehicle is described by a non-linear 6-state model that accounts for lateral sliding and mass distribution:
 
-- **Stati**:  
 
-```math
-x = [X, Y, \phi, v_x, v_y, \omega]
-```
+* **States ($x$):**
+    $$x = [X, Y, \phi, v_x, v_y, \omega]$$
+    * $X, Y$: Global coordinates.
+    * $\phi$: Yaw angle (heading).
+    * $v_x, v_y$: Longitudinal and lateral velocities.
+    * $\omega$: Yaw rate.
 
-dove:  
-- $X, Y$: posizione globale  
-- $\phi$: angolo di imbardata  
-- $v_x, v_y$: velocità longitudinali e laterali  
-- $\omega$: velocità di imbardata  
+* **Inputs ($u$):**
+    $$u = [d, \delta]$$
+    * $d$: Duty cycle (motor traction/braking).
+    * $\delta$: Steering angle.
 
----
-
-- **Input**:  
-
-```math
-u = [d, \delta]
-```
-
-dove:  
-- $d$: comando di trazione  
-- $\delta$: angolo di sterzo  
-
-Le forze delle gomme sono modellate usando una versione semplificata della **formula di Pacejka**.
+Tire interactions are modeled using the **Pacejka Magic Formula**, which calculates lateral forces ($F_y$) based on slip angles ($\alpha$) and specific friction coefficients.
 
 ---
 
-### Model Predictive Control (MPC)
+### Model Predictive Control (MPC) logic
+The controller follows a **Receding Horizon** strategy:
 
-Il funzionamento segue un ciclo continuo:
+1.  **Prediction**: Uses the non-linear model to estimate the vehicle's future states over a prediction horizon $N$.
+2.  **Linearization**: Since the model is non-linear, it performs **Time-Varying Linearization (TV-MPC)** around a nominal trajectory at each step.
+3.  **Optimization**: Solves a **Quadratic Program (QP)** to find the control sequence that minimizes a cost function (tracking error + control effort).
+4.  **Feedback**: Only the first command of the sequence is applied; the process repeats at the next sampling time $T_s$ with updated sensor data.
 
-1. **Prevede** → utilizza il modello dinamico per stimare il comportamento futuro del veicolo su un orizzonte finito \(N\).  
-2. **Ottimizza** → calcola la sequenza ottimale di comandi \(u\) che minimizza una funzione di costo (errore di traiettoria, sforzo di controllo) rispettando i vincoli fisici.  
-3. **Applica** → invia solo il primo comando della sequenza.  
-4. **Ripete** → misura il nuovo stato e ricomincia.  
 
----
-
-### Linearizzazione Time-Varying (TV-QP)
-Poiché il modello è non lineare, non può essere risolto direttamente come QP.  
-Ad ogni passo il modello viene **linearizzato** attorno a una traiettoria nominale, trasformando il problema in un **Quadratic Program (QP)** risolvibile in modo efficiente.
 
 ---
 
-##  Note 
+## Project Structure
 
-- **Assenza di Rumore**: simulazione deterministica (niente rumore di processo o di misura).  
-- **Formulazione come Tracking**: l'errore è calcolato come distanza geometrica dal riferimento (trajectory tracking), invece che con coordinate di Frenet o errori angolari (path following).
+### `mpc_6stati.py` (Core Controller)
+This module handles the physics and the math:
+* **`tire_forces`**: Computes slip angles and non-linear tire reactions.
+* **`f_cont`**: Defines the continuous-time ODEs for the vehicle dynamics.
+* **`linearize_discretize`**: Performs central finite differences to obtain $A_d, B_d$, and $g$ matrices for the TV-QP formulation.
+* **`mpc_step`**: Formulates the optimization problem with `cvxpy`, enforcing constraints on input magnitude (e.g., $|\delta| \leq 0.6$ rad) and input rates (to ensure smoothness).
 
----
-
-##  Struttura dei File
-
-### `mpc_6stati.py`
-Contiene la logica del controllore e del modello fisico:
-- `Params`: dizionario dei parametri fisici (massa, inerzia, coefficienti gomme, ecc.).  
-- `tire_forces(x, u, p)`: calcola le forze generate dalle gomme.  
-- `f_cont(x, u, p)`: implementa le equazioni del moto non lineari.  
-- `linearize_discretize(x, u, Ts, p)`: linearizza e discretizza il modello.  
-- `mpc_step(...)`: funzione principale dell’MPC che formula e risolve il QP con **cvxpy**.  
-
-### `main.py`
-Orchestra l’intera simulazione:
-- **Profili di velocità** → `vref_profile_*`  
-- **Generazione riferimenti** → `ref_window_from_x_with_vref(...)`  
-- **Ciclo di simulazione** → aggiorna stato e comandi MPC ad ogni passo.  
-- **Animazione** → genera `mpc_ref_vs_vehicle.gif` con `matplotlib.animation`.  
+### `main.py` (Simulation & Scenarios)
+This script runs the actual experiment:
+* **Velocity Profiles**: Defines target speeds (Ramp, Trapezoidal, or Sine wave).
+* **Path Generation**: Creates geometric references such as a **Parabolic Path** ($y = 0.1x^2$) or **Sinusoidal Path**.
+* **Simulation Loop**: Integrates the vehicle dynamics over time and stores the history for analysis.
+* **Animation**: Uses `matplotlib.animation` to save the results as `mpc_tracking.gif`.
 
 ---
 
-##  Scenari di Riferimento Testati
+## Tested Scenarios
 
-### 1. Percorso Sinusoidale
-Utile per testare transizioni e curve costanti.
+The reference path $(X^\*, Y^\*, \phi^\*)$ is generated using the following geometric functions:
 
-```python
-ys = 0.5 * np.sin(0.5 * xs)
-dydx = 0.25 * np.cos(0.5 * xs)
-phs = np.arctan(dydx)
-return np.stack([xs, ys, phs], axis=1)
-```
+### 1. Parabolic Tracking
+Used to test the controller's ability to handle a continuously increasing curvature:
+* **Position**: $Y^* = 0.1 \cdot (X^*)^2$
+* **Heading**: $\phi^* = \arctan(0.2 \cdot X^*)$
 
-### 2) Percorso Parabolico
-Utile per testare la capacità del controllore di adattarsi a variazioni di curvatura.
+### 2. Sinusoidal Tracking
+Used to test S-curves and rapid changes in direction:
+* **Position**: $Y^* = 0.5 \cdot \sin(0.5 \cdot X^*)$
+* **Heading**: $\phi^* = \arctan(0.25 \cdot \cos(0.5 \cdot X^*))$
+---
 
-```python
-# Equazione di una parabola (es. y = 0.1 * x^2)
-ys = 0.1 * xs**2
-dydx = 0.2 * xs
-phs = np.arctan(dydx)
-return np.stack([xs, ys, phs], axis=1)
-```
-### Prerequisiti
+## Getting Started
+
+### Prerequisites
+Install the required libraries:
 ```bash
 pip install numpy matplotlib cvxpy osqp
 ```
 
-### Come Eseguire il Progetto
+### Running the Project
+
+Execute the main simulation script:
+
 ```bash
 python main.py
+
 ```
 
-Lo script eseguirà la simulazione (potrebbe richiedere qualche minuto) e mostrerà un grafico.
-Al termine, salverà l'animazione come mpc_ref_vs_vehicle.gif nella stessa cartella.
+Upon completion, the script will print control statistics (mean duty cycle, steering range) and generate a GIF animation of the tracking performance.
 
-## Come Sperimentare
+---
+## Acknowledgments
 
-È possibile modificare la simulazione per testare diversi scenari:
+This implementation is inspired by and based on the concepts found in the MPCC (Model Predictive Contouring Control) repository by Alexander Liniger.
+https://github.com/alexliniger/MPCC.git
 
-- **Cambiare il Percorso**: attiva o disattiva i blocchi di codice commentati nella funzione `ref_window_from_x_with_vref` in `main.py`.
+## Experimentation Guide
 
-- **Modificare il Comportamento del Controllore**: all'interno della chiamata a `mpc_step` in `main.py`, si possono modificare i pesi della funzione di costo per alterare le priorità del controllore:
-  - `q_c`, `q_phi`: aumenta per un inseguimento della traiettoria più aggressivo
-  - `R`, `Rd`: aumenta per ottenere un controllo più fluido e meno dispendioso
-  - `N`: modifica l'orizzonte di previsione
+You can modify the controller's behavior by adjusting parameters in `main.py`:
 
-- **Cambiare le Condizioni Iniziali**: modifica la variabile `x` all'inizio del ciclo di simulazione in `main.py`.
+* **Aggressiveness**: Increase `q_c` (lateral error) or `q_phi` (heading error) weights for tighter tracking.
+* **Smoothing**: Increase `Rd` weights to reduce jerky steering movements.
+* **Prediction**: Change `N` to adjust the look-ahead horizon.
+* **Geometry**: Toggle the commented sections in `ref_window_from_x_with_vref` to switch between a Sine wave or a Parabola.
+
 
