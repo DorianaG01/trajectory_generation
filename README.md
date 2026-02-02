@@ -10,7 +10,6 @@ The project integrates physical modeling (Dynamic Bicycle Model) with Deep Learn
 The repository is organized into three main modules:
 
 ```text
-📦 Root
  ┣ 📂 generation_traj   # 1. Data Generation (Uses MPC logic)
  ┣ 📂 KalmanNet         # 2. State Estimation (AI + Filtering)
  ┗ 📂 MPC               # 3. Motion Control (Core Logic)
