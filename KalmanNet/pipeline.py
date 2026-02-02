@@ -1,309 +1,406 @@
 import torch
 import torch.nn as nn
+import torch.optim as optim
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+import os
+import wandb
+import matplotlib.pyplot as plt
 import random
-import time
-import numpy as np
-import wandb 
-from matplotlib import pyplot as plt
-from torch_optimizer import Lookahead
-import torch.optim.lr_scheduler as lr_scheduler
+from torch.nn.utils import clip_grad_norm_
 
+PHI_IDX = 2   # Index of Yaw angle in state vector
+EPS_DB = 1e-12
 
+# --- LOSS FUNCTIONS ---
 
-class Pipeline_EKF:
- 
-    def __init__(self, Time, folderName, modelName):
-        super().__init__()
-        self.Time = Time
-        self.folderName = folderName + '/'
-        self.modelName = modelName
-        self.modelFileName = self.folderName + "model_" + self.modelName + ".pt" 
-        self.PipelineName = self.folderName + "pipeline_" + self.modelName + ".pt"
+def _angular_mse_from_real(phi_pred_real, phi_tgt_real):
+    """Calculates angular MSE handling 2pi periodicity."""
+    diff = torch.atan2(torch.sin(phi_pred_real - phi_tgt_real),
+                       torch.cos(phi_pred_real - phi_tgt_real))
+    return (diff ** 2).mean()
 
+def loss_x_with_angular(x_out_norm, x_tgt_norm, x_mean, x_std, m, phi_idx=PHI_IDX):
+    """
+    Computes State Loss.
+    Combines standard MSE for linear channels and Angular MSE for phi.
+    """
+    # 1. MSE on linear channels (non-phi) in normalized space
+    diff2 = (x_out_norm - x_tgt_norm) ** 2
+    idx_no_phi = [i for i in range(m) if i != phi_idx]
+    mse_no_phi = diff2[:, idx_no_phi, :].mean() 
 
-    def save(self):
-        torch.save(self, self.PipelineName)
-
-
-    def setssModel(self, ssModel):
-        self.ssModel = ssModel 
-
-    def setModel(self, model):
-        self.model = model 
-
-    def setTrainingParams(self, n_steps, n_batch, lr, wd, alpha):
-        self.device = torch.device('cpu')
-        self.N_steps = n_steps  # Number of Training Steps
-        self.N_B = n_batch # Number of Samples in Batch
-        self.learningRate = lr # Learning Rate
-        self.weightDecay = wd # L2 Weight Regularization - Weight Decay
-        self.alpha = alpha # Composition loss factor
-        # MSE LOSS Function
-        self.loss_fn = nn.MSELoss(reduction='mean')
-
-        base_optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.learningRate, weight_decay=self.weightDecay)
-        self.optimizer = Lookahead(base_optimizer)
-
-        
-    def NNTrain(self, SysModel, cv_input, cv_target, cv_control, train_input, train_target, train_control, path_results, CompositionLoss, loadModel):
-
-        if loadModel:
-            checkpoint = torch.load(path_results+'.pt', map_location=torch.device('cpu'))
-            self.model.load_state_dict(checkpoint['model_state_dict'])
-            self.optimizer.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-
-        startEpoch = 0
-
-
-        self.N_E = len(train_input)
-        self.N_CV = len(cv_input)
-
-        self.MSE_cv_linear_epoch = torch.zeros([self.N_steps])
-        self.MSE_cv_dB_epoch = torch.zeros([self.N_steps])
-
-        #scheduler = lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=self.N_steps, eta_min=1e-7)
+    # 2. Angular MSE on phi in real space (denormalized)
+    x_out_real = (x_out_norm * x_std) + x_mean
+    x_tgt_real = (x_tgt_norm * x_std) + x_mean
     
-        """scheduler = lr_scheduler.CyclicLR(self.optimizer, 
-                                      base_lr=1e-6,           # Il LR minimo dell'oscillazione
-                                      max_lr=self.learningRate, #  5e-5)
-                                      step_size_up=30,        # N. di epoche per salire
-                                      step_size_down=30,      # N. di epoche per scendere
-                                      mode='triangular2')     # Politica di oscillazione"""
-        """scheduler = lr_scheduler.OneCycleLR(self.optimizer, 
-                                    max_lr=self.learningRate, 
-                                    epochs=self.N_steps, 
-                                    steps_per_epoch=1,
-                                    pct_start=0.2)"""
+    phi_pred = x_out_real[:, phi_idx, :]
+    phi_tgt  = x_tgt_real[:, phi_idx, :]
+    mse_phi_ang = _angular_mse_from_real(phi_pred, phi_tgt)
 
-        self.MSE_train_linear_epoch = torch.zeros([self.N_steps])
-        self.MSE_train_dB_epoch = torch.zeros([self.N_steps])
+    return (float(m-1) / m) * mse_no_phi + (1.0 / m) * mse_phi_ang
 
 
-        self.MSE_cv_dB_opt = 1000
-        self.MSE_cv_idx_opt = 0
+def compute_composite_loss(x_out_norm, x_tgt_norm, y_tgt_norm, 
+                           x_mean, x_std, m, n, 
+                           alpha, phi_idx=PHI_IDX):
+    
+    # Loss 1: State Loss (x_out vs x_tgt)
+    loss_x = loss_x_with_angular(x_out_norm, x_tgt_norm, x_mean, x_std, m, phi_idx)
+    
+    # Loss 2: Observation Loss (approximated as subset of x vs y_tgt)
+    # Indices corresponding to observations (everything except phi)
+    idx_y = [i for i in range(m) if i != phi_idx] 
+   
+    y_pred_norm = x_out_norm[:, idx_y, :]
+    
+    loss_y = torch.nn.functional.mse_loss(y_pred_norm, y_tgt_norm, reduction='mean')
+    
+    return alpha * loss_x + (1.0 - alpha) * loss_y
 
-        for ti in range(startEpoch, self.N_steps):
 
-            if ti == 200: # Step manuale di riduzione del LR
-                print(f"--- STEP MANUALE: Epoca {ti}, taglio LR a 1e-6 ---")
-                new_lr = 1e-6 
+def train_epoch(model, optimizer, y_train, u_train, x_train, norm_stats, params):
+    """
+    Unified training epoch.
+    Supports:
+    1. 'standard': TBPTT (update every K steps).
+    2. 'accumulation': Gradient Accumulation (update at end of trajectory).
+    """
+ 
+    strategy = params['strategy']  # 'standard' or 'accumulation'
+    N_E, N_batch = params['N_E'], params['N_batch']
+    K_TBPTT, T = params['K_TBPTT'], params['T']
+    m, n = params['m'], params['n']
+    device = params['device']
+    use_composite = params['CompositionLoss']
+    alpha = params['alpha']
+    
+    x_mean = norm_stats['x_mean'].to(device)
+    x_std = norm_stats['x_std'].to(device)
+    
+    model.train()
+    
+    indices = random.sample(range(N_E), k=N_batch)
+    y_batch = y_train[indices].to(device)
+    u_batch = u_train[indices].to(device)
+    x_batch = x_train[indices].to(device)
+
+    y_train_norm = (y_batch - norm_stats['y_mean'].to(device)) / norm_stats['y_std'].to(device)
+    x_train_norm = (x_batch - x_mean) / x_std
+   
+    model.batch_size = N_batch
+    model.init_hidden_KNet()
+
+    # Sequence Initialization with noise
+    init_noise_std = 0.2
+    x_0_true_norm = x_train_norm[:, :, 0]
+    noise = torch.randn_like(x_0_true_norm) * init_noise_std
+    m1x_0_batch = (x_0_true_norm + noise).unsqueeze(2)
+    model.InitSequence(m1x_0_batch, T)
+
+    optimizer.zero_grad()
+    
+    epoch_loss_acc = 0.0
+    
+    outputs_chunk = []
+    x_tgts_chunk = []
+    y_tgts_chunk = []
+ 
+    num_chunks = (T + K_TBPTT - 1) // K_TBPTT
+    chunks_processed = 0
+
+    for t in range(T):
+        # --- Forward Step ---
+        y_in = y_train_norm[:, :, t].unsqueeze(2)
+        u_in = u_batch[:, :, t].unsqueeze(2)
+        
+        x_out = model(y_in, u_in) 
+        
+        outputs_chunk.append(x_out.squeeze(2))
+        x_tgts_chunk.append(x_train_norm[:, :, t])
+        
+        if use_composite:
+            y_tgts_chunk.append(y_train_norm[:, :, t])
+
+        # --- TBPTT Checkpoint ---
+        is_chunk_end = ((t + 1) % K_TBPTT == 0) or ((t + 1) == T)
+        
+        if is_chunk_end:
+            x_out_chunk = torch.stack(outputs_chunk, dim=2) # [B, m, K]
+            x_tgt_chunk = torch.stack(x_tgts_chunk, dim=2)
+            
+            # --- COMPUTE LOSS ---
+            if use_composite:
+                y_tgt_chunk = torch.stack(y_tgts_chunk, dim=2)
+                loss_val = compute_composite_loss(
+                    x_out_chunk, x_tgt_chunk, y_tgt_chunk,
+                    x_mean, x_std, m, n, alpha, PHI_IDX
+                )
+            else:
+                loss_val = loss_x_with_angular(
+                    x_out_chunk, x_tgt_chunk, x_mean, x_std, m, PHI_IDX
+                )
+
+            # --- BACKWARD PASS ---
+            if strategy == 'accumulation':
+                # Scale loss to average correctly at the end
+                loss_scaled = loss_val / num_chunks
+                loss_scaled.backward()
                
-                for param_group in self.optimizer.optimizer.param_groups:
-                    param_group['lr'] = new_lr
+            else: 
+                # Strategy == 'standard'
+                loss_val.backward()
+                clip_grad_norm_(model.parameters(), max_norm=5.0)
+                optimizer.step()
+                optimizer.zero_grad()
 
-        # Training Sequence Batch 
-
-            self.optimizer.zero_grad()
+            # Logging & Cleanup
+            epoch_loss_acc += loss_val.item()
+            chunks_processed += 1
             
-            # Training Mode
-            self.model.train()
-            self.model.batch_size = self.N_B
-            # Init Hidden State
-            self.model.init_hidden_KNet()
-
-            # Init Training Batch tensors
-            y_training_batch = torch.zeros([self.N_B, SysModel.n, SysModel.T]).to(self.device) # Misure [B, 5, T]
-            u_training_batch = torch.zeros([self.N_B, SysModel.d, SysModel.T]).to(self.device) # Controlli [B, 2, T] 
-            train_target_batch = torch.zeros([self.N_B, SysModel.m, SysModel.T]).to(self.device) # Stato [B, 6, T]
-            x_out_training_batch = torch.zeros([self.N_B, SysModel.m, SysModel.T]).to(self.device) # Output [B, 6, T]
+            outputs_chunk = []
+            x_tgts_chunk = []
+            y_tgts_chunk = []
             
-            # Randomly select N_B training sequences
-            assert self.N_B <= self.N_E  # N_B must be smaller than N_E
-            n_e = random.sample(range(self.N_E), k=self.N_B)
-            ii = 0
-            for index in n_e:
-                y_training_batch[ii, :, :] = train_input[index]
-                train_target_batch[ii, :, :] = train_target[index]
-                u_training_batch[ii, :, :] = train_control[index] 
-                ii += 1
+            # Detach Hidden States
+            model.h_Q.detach_()
+            model.h_Sigma.detach_()
+            model.h_S.detach_()
+            model.m1x_posterior.detach_()
 
-            # Init Sequence
-            self.model.InitSequence(SysModel.m1x_0.reshape(1, SysModel.m, 1).repeat(self.N_B, 1, 1), SysModel.T)
+    # --- END OF LOOP T ---
+    
+    # If accumulation mode, update weights now
+    if strategy == 'accumulation':
+        clip_grad_norm_(model.parameters(), max_norm=5.0)
+        optimizer.step()
+        optimizer.zero_grad()
 
-            # Forward Computation
-            for t in range(0, SysModel.T):
-                y_t = torch.unsqueeze(y_training_batch[:, :, t], 2)
-                u_t = torch.unsqueeze(u_training_batch[:, :, t], 2)
-                x_out_training_batch[:, :, t] = torch.squeeze(self.model(y_t, u_t))
+    avg_loss = epoch_loss_acc / max(1, chunks_processed)
+    loss_db = 10 * torch.log10(torch.tensor(avg_loss).clamp_min(EPS_DB))
+    
+    return avg_loss, loss_db
+
+def validate_epoch(model, y_val_norm, u_val, x_val_norm, norm_stats, params):
+    """
+    Validation Loop. Uses full forward pass (no gradient chunking).
+    """
+    N_CV = params['N_CV'] 
+    T, m, n = params['T'], params['m'], params['n']
+    use_composite = params['CompositionLoss']
+    alpha = params['alpha']
+    device = params['device']
+    
+    x_mean = norm_stats['x_mean'].to(device)
+    x_std = norm_stats['x_std'].to(device)
+
+    model.eval()
+    with torch.no_grad():
+        model.batch_size = N_CV
+        model.init_hidden_KNet()
+
+        # Init state with small noise for robustness
+        x_0 = x_val_norm[:, :, 0]
+        m1x_0 = (x_0 + torch.randn_like(x_0)*0.2).unsqueeze(2)
+        model.InitSequence(m1x_0, T)
+
+        # Full sequence forward
+        x_out_list = []
+        for t in range(T):
+            out = model(y_val_norm[:, :, t].unsqueeze(2),
+                        u_val[:, :, t].unsqueeze(2))
+            x_out_list.append(out.squeeze(2))
+        
+        x_out_full = torch.stack(x_out_list, dim=2) 
+
+        # Compute Loss
+        if use_composite:
+            loss_val = compute_composite_loss(
+                x_out_full, x_val_norm, y_val_norm, 
+                x_mean, x_std, m, n, alpha, PHI_IDX
+            )
+        else:
+            loss_val = loss_x_with_angular(
+                x_out_full, x_val_norm, 
+                x_mean, x_std, m, PHI_IDX
+            )
+
+    loss_lin = loss_val.item()
+    loss_db = 10 * torch.log10(torch.tensor(loss_lin).clamp_min(EPS_DB))
+    return loss_lin, loss_db
 
 
-            # Compute Training Loss
-            MSE_trainbatch_linear_LOSS = 0
-            if CompositionLoss:
-                y_hat = torch.zeros([self.N_B, SysModel.n, SysModel.T]) # [B, 5, T]
-                for t in range(SysModel.T):
-                    # SysModel.h prende [B, 6, 1] e restituisce [B, 5, 1]
-                    y_hat[:, :, t] = torch.squeeze(SysModel.h(torch.unsqueeze(x_out_training_batch[:, :, t], dim=2)), dim=2)
-                
-                # loss1 = loss(stima_6D, target_6D)
-                loss1 = self.loss_fn(x_out_training_batch, train_target_batch)
-                # loss2 = loss(h(stima)_5D, misura_5D)
-                loss2 = self.loss_fn(y_hat, y_training_batch)
-                
-                MSE_trainbatch_linear_LOSS = self.alpha * loss1 + (1 - self.alpha) * loss2
-                
-            else:  # no composition loss
-                MSE_trainbatch_linear_LOSS = self.loss_fn(x_out_training_batch, train_target_batch)
+class Pipeline_Vehicle_KNet:
+    
+    def __init__(self, folderName, modelName):
+        self.folderName = folderName
+        self.modelName = modelName
+        self.best_model_path = os.path.join(self.folderName, f"best_model_{self.modelName}.pt")
+        os.makedirs(self.folderName, exist_ok=True)
+        print(f"Pipeline initialized. Output folder: {self.folderName}")
 
-            # dB Loss
-            self.MSE_train_linear_epoch[ti] = MSE_trainbatch_linear_LOSS.item()
-            epsilon =  1e-10
-            self.MSE_train_dB_epoch[ti] = 10 * torch.log10(self.MSE_train_linear_epoch[ti]) + epsilon
+    def set_models(self, sys_model, model):
+        self.sys_model = sys_model
+        self.model = model
+        print("Models set.")
 
-            # Optimizing 
-            MSE_trainbatch_linear_LOSS.backward()
-            #torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1)
-            torch.nn.utils.clip_grad_value_(self.model.parameters(), clip_value=1.0)
-            self.optimizer.step()
+    def set_data(self, train_data, val_data, test_data, norm_stats, device):
+        self.y_train, self.u_train, self.x_train = train_data
+        self.y_val, self.u_val, self.x_val = val_data
+        self.y_test, self.u_test, self.x_test = test_data
+        
+        self.norm_stats = norm_stats
+        self.device = device
+        
+        self.N_E = len(self.y_train)
+        self.N_CV = len(self.y_val)
+        self.N_T = len(self.y_test)
+        print(f"Data Loaded. Train: {self.N_E}, Val: {self.N_CV}, Test: {self.N_T}")
 
-            #scheduler.step()
+    def set_training_params(self, n_steps, n_batch, lr, wd, K_TBPTT, T,
+                            training_strategy='standard', # 'standard' or 'accumulation'
+                            CompositionLoss=False, alpha=0.5):
+        """
+        Configure training parameters.
+        training_strategy: 
+          - 'standard': updates weights every K_TBPTT steps.
+          - 'accumulation': accumulates gradients over T and updates at the end.
+        """
+        self.N_steps = n_steps
+        self.N_batch = n_batch
+        self.lr = lr
+        self.wd = wd
+        self.K_TBPTT = K_TBPTT
+        self.T = T
+        self.m = self.sys_model.m
+        self.n = self.sys_model.n
+        
+        self.strategy = training_strategy
+        self.CompositionLoss = CompositionLoss
+        self.alpha = alpha
 
-            # Validation Sequence Batch 
-            self.model.eval()
-            self.model.batch_size = self.N_CV
-            # Init Hidden State
-            self.model.init_hidden_KNet()
+        self.optimizer = optim.AdamW(self.model.parameters(), lr=self.lr, weight_decay=self.wd)
+        self.scheduler = ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5, patience=10, min_lr=1e-7)
+        
+        self.train_loss_history_db = []
+        self.val_loss_history_db = []
+        
+        print(f"Training Config:")
+        print(f" - Strategy: {self.strategy.upper()}")
+        print(f" - TBPTT K: {self.K_TBPTT}")
+        print(f" - Composition Loss: {self.CompositionLoss} (alpha={self.alpha})")
 
-            with torch.no_grad():
+    def train(self):
+        wandb.init(
+            project="KalmanNet_Vehicle_Hybrid",  
+            name=f"{self.modelName}_{self.strategy}",            
+            config={
+                "strategy": self.strategy,
+                "epochs": self.N_steps,
+                "batch_size": self.N_batch,
+                "TBPTT_K": self.K_TBPTT,
+                "CompositionLoss": self.CompositionLoss,
+                "alpha": self.alpha
+            }
+        )
+        wandb.watch(self.model)
 
-                SysModel.T_test = cv_input.size()[-1] 
-                x_out_cv_batch = torch.empty([self.N_CV, SysModel.m, SysModel.T_test]).to(self.device)
+        best_val_loss = float('inf')
 
-                # Init Sequence
-                self.model.InitSequence(SysModel.m1x_0.reshape(1, SysModel.m, 1).repeat(self.N_CV, 1, 1), SysModel.T_test)
+        # Prepare validation data
+        y_val_dev = self.y_val.to(self.device)
+        u_val_dev = self.u_val.to(self.device)
+        x_val_dev = self.x_val.to(self.device)
+        
+        # Normalize validation set
+        val_in_norm = (y_val_dev - self.norm_stats['y_mean'].to(self.device)) / self.norm_stats['y_std'].to(self.device)
+        val_tgt_norm = (x_val_dev - self.norm_stats['x_mean'].to(self.device)) / self.norm_stats['x_std'].to(self.device)
 
-                for t in range(0, SysModel.T_test):
-                    y_t = torch.unsqueeze(cv_input[:, :, t], 2)
-                    u_t = torch.unsqueeze(cv_control[:, :, t], 2) 
-                    x_out_cv_batch[:, :, t] = torch.squeeze(self.model(y_t, u_t))
+        params_train = {
+            'N_E': self.N_E, 'N_batch': self.N_batch, 'K_TBPTT': self.K_TBPTT, 
+            'T': self.T, 'm': self.m, 'n': self.n, 'device': self.device,
+            'strategy': self.strategy,
+            'CompositionLoss': self.CompositionLoss, 'alpha': self.alpha
+        }
+        params_val = {
+            'N_CV': self.N_CV, 'T': self.T, 'm': self.m, 'n': self.n, 'device': self.device,
+            'CompositionLoss': self.CompositionLoss, 'alpha': self.alpha
+        }
 
-                # Compute CV Loss
-                # La CV loss è calcolata solo sullo stato (6D vs 6D)
-                MSE_cvbatch_linear_LOSS = self.loss_fn(x_out_cv_batch, cv_target)
+        print(f"Start Training ({self.strategy})")
 
-                # dB Loss
-                self.MSE_cv_linear_epoch[ti] = MSE_cvbatch_linear_LOSS.item()
-                epsilon =  1e-10
-                self.MSE_cv_dB_epoch[ti] = 10 * torch.log10(self.MSE_cv_linear_epoch[ti]) + epsilon
-                #scheduler.step(MSE_cvbatch_linear_LOSS.item())
-
-                if (self.MSE_cv_dB_epoch[ti] < self.MSE_cv_dB_opt):
-                    self.MSE_cv_dB_opt = self.MSE_cv_dB_epoch[ti]
-                    self.MSE_cv_idx_opt = ti
-
-                    # Salva il percorso in una variabile
-                    model_path = path_results + 'best_model.pt'
-
-                    torch.save({
-                        'epoch': ti, 'model_state_dict': self.model.state_dict(), 'optimizer_state_dict': self.optimizer.optimizer.state_dict()
-                    }, model_path) 
-
-                    artifact = wandb.Artifact(f'model-{wandb.run.name}', type='model')
-                    artifact.add_file(model_path)
-                    
-                    wandb.log_artifact(artifact, aliases=['best', f'epoch_{ti}'])
-
-            # Training Summary 
-            print(ti, "MSE Training :", self.MSE_train_dB_epoch[ti], "[dB]", "MSE Validation :",
-                  self.MSE_cv_dB_epoch[ti],
-                  "[dB]")
+        for epoch in range(self.N_steps):
             
+            # 1. Train Epoch
+            train_loss, train_db = train_epoch(
+                self.model, self.optimizer, 
+                self.y_train, self.u_train, self.x_train, 
+                self.norm_stats, params_train
+            )
+            self.train_loss_history_db.append(train_db)
+
+            # 2. Validation Epoch
+            val_loss, val_db = validate_epoch(
+                self.model, 
+                val_in_norm, u_val_dev, val_tgt_norm, 
+                self.norm_stats, params_val
+            )
+            self.val_loss_history_db.append(val_db)
+            
+            # 3. Step Scheduler & Log
+            self.scheduler.step(val_loss)
+            curr_lr = self.optimizer.param_groups[0]['lr']
+
             wandb.log({
-                "epoch": ti,
-                "train_loss_dB": self.MSE_train_dB_epoch[ti],
-                "val_loss_dB": self.MSE_cv_dB_epoch[ti],
-                "train_loss_linear": self.MSE_train_linear_epoch[ti],
-                "val_loss_linear": self.MSE_cv_linear_epoch[ti],
-                "learning_rate": self.optimizer.optimizer.param_groups[0]['lr']
+                "epoch": epoch, "lr": curr_lr,
+                "train_dB": train_db, "val_dB": val_db
             })
 
-            if (ti > 1):
-                d_train = self.MSE_train_dB_epoch[ti] - self.MSE_train_dB_epoch[ti - 1]
-                d_cv = self.MSE_cv_dB_epoch[ti] - self.MSE_cv_dB_epoch[ti - 1]
-                print("diff MSE Training :", d_train, "[dB]", "diff MSE Validation :", d_cv, "[dB]")
+            print(f"{epoch:3d} | Train: {train_db:6.2f}dB | Val: {val_db:6.2f}dB | LR: {curr_lr:.1e}")
 
-            print("Optimal idx:", self.MSE_cv_idx_opt, "Optimal :", self.MSE_cv_dB_opt, "[dB]")
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                torch.save(self.model.state_dict(), self.best_model_path)
+                print(f"   -> Saved Best Model: {best_val_loss:.5f}")
 
-        #self.learningCurve(self.MSE_train_dB_epoch, self.MSE_cv_dB_epoch)
+        wandb.finish()
+        print("Training End.")
 
-
-        return [self.MSE_cv_linear_epoch, self.MSE_cv_dB_epoch, self.MSE_train_linear_epoch, self.MSE_train_dB_epoch]
-
-    def NNTest(self, SysModel, test_input, test_target, test_control, path_results, load_model=False, load_model_path=None):
-    
-        checkpoint = torch.load(path_results + 'best_model.pt', map_location=torch.device('cpu'))
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-
-        self.N_T = test_input.shape[0]
-        SysModel.T_test = test_input.size()[-1]
-        self.MSE_test_linear_arr = torch.zeros([self.N_T])
-        x_out_test = torch.zeros([self.N_T, SysModel.m, SysModel.T_test]).to(self.device) # [N, 6, T]
-
-        # MSE LOSS Function
-        loss_fn = nn.MSELoss(reduction='mean')
-
-        # Test mode
+    def test(self):
+        print(f"Testing Best Model: {self.best_model_path}")
+        self.model.load_state_dict(torch.load(self.best_model_path, map_location=self.device))
+        self.model.to(self.device)
         self.model.eval()
-        self.model.batch_size = self.N_T
-        # Init Hidden State
-        self.model.init_hidden_KNet()
-        torch.no_grad()
-        MSESingleTrajectory = torch.zeros([self.N_T, SysModel.T_test])
 
-        start = time.time()
+     
+        y_test_dev = self.y_test.to(self.device)
+        u_test_dev = self.u_test.to(self.device)
+        x_test_dev = self.x_test.to(self.device)
 
+        test_in_norm = (y_test_dev - self.norm_stats['y_mean'].to(self.device)) / self.norm_stats['y_std'].to(self.device)
+        test_tgt_norm = (x_test_dev - self.norm_stats['x_mean'].to(self.device)) / self.norm_stats['x_std'].to(self.device)
 
-        self.model.InitSequence(SysModel.m1x_0.reshape(1, SysModel.m, 1).repeat(self.N_T, 1, 1), SysModel.T_test)
+        params_test = {
+            'N_CV': self.N_T, 'T': self.T, 'm': self.m, 'n': self.n, 'device': self.device,
+            'CompositionLoss': self.CompositionLoss, 'alpha': self.alpha
+        }
 
-        for t in range(0, SysModel.T_test):
-            y_t = torch.unsqueeze(test_input[:, :, t], 2)
-            u_t = torch.unsqueeze(test_control[:, :, t], 2) 
-            x_out_test[:, :, t] = torch.squeeze(self.model(y_t, u_t))
+        l_lin, l_db = validate_epoch(
+            self.model, test_in_norm, u_test_dev, test_tgt_norm, 
+            self.norm_stats, params_test
+        )
+        
+        print(f"TEST RESULT -> Loss: {l_db:.4f} dB (MSE: {l_lin:.6f})")
 
-        end = time.time()
-        t = end - start
-
-        # MSE loss
-        for j in range(self.N_T):  # cannot use batch due to different length and std computation
-            self.MSE_test_linear_arr[j] = loss_fn(x_out_test[j, :, :], test_target[j, :, :]).item()
-            for k in range(SysModel.T_test):
-                MSESingleTrajectory[j][k] = loss_fn(x_out_test[j, :, k], test_target[j, :, k]).item()
-
-
-        # Average
-        self.MSE_test_linear_avg = torch.mean(self.MSE_test_linear_arr)
-        self.MSE_test_dB_avg = 10 * torch.log10(self.MSE_test_linear_avg)
-
-        # Standard deviation
-        self.MSE_test_linear_std = torch.std(self.MSE_test_linear_arr, unbiased=True)
-
-        # Confidence interval
-        self.test_std_dB = 10 * torch.log10(self.MSE_test_linear_std + self.MSE_test_linear_avg) - self.MSE_test_dB_avg
-
-        # Print MSE and std
-        str_name = self.modelName + "-" + "MSE LOSS:"
-        print("--", str_name, self.MSE_test_dB_avg, "[dB]")
-        str_name = self.modelName + "-" + "STD:"
-        print("--", str_name, self.test_std_dB, "[dB]")
-        # Print Run Time
-        #print("Inference Time:", t)
-
-        KalmanGainKN = self.model.KGain
-        MSESingleTrajectory = 10*torch.log10(MSESingleTrajectory)
-
-        return [self.MSE_test_linear_arr, self.MSE_test_linear_avg, self.MSE_test_dB_avg, x_out_test, t, KalmanGainKN, MSESingleTrajectory]
-
-
-    def learningCurve(self, trainLoss, validationLoss):
-        print(trainLoss.shape)
-        print(validationLoss.shape)
-        plt.plot(range(1, len(trainLoss)+1), trainLoss, label='Train Loss', marker='o')
-        plt.plot(range(1, len(validationLoss)+1), validationLoss, label='Validation Loss', marker='x')
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.title('Learning Curve')
-        plt.legend()
+    def plot_learning_curve(self):
+        plt.figure(figsize=(10,5))
+        plt.plot(self.train_loss_history_db, label="Train")
+        plt.plot(self.val_loss_history_db, label="Val")
+        plt.title(f"Learning Curve ({self.strategy})")
+        plt.ylabel("MSE [dB]")
+        plt.xlabel("Epoch")
         plt.grid(True)
-        plt.show()
-        plt.close('all')
+        plt.legend()
+        path = os.path.join(self.folderName, f'lc_{self.modelName}.png')
+        plt.savefig(path)
+        print(f"Plot saved to {path}")
+        plt.close()
