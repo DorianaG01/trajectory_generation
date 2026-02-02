@@ -36,7 +36,7 @@ This is the final step of the pipeline. It combines the data from both generatio
 * **ID Re-indexing**: It automatically calculates an ID offset (e.g., +5000) for the second dataset to ensure every trajectory in the final file has a **unique ID**.
 * **Outputs**: Produces the final files:
 * `combined_dataset_clean.csv` (**Ground Truth**)
-* `combined_dataset_noisy_err005.csv` (**Sensor Measurements**)
+* `combined_dataset_noisy.csv` (**Sensor Measurements**)
 
 
 
