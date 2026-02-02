@@ -1,175 +1,138 @@
 import torch
-import torch.nn as nn
-from datetime import datetime
-import matplotlib.pyplot as plt
+import sys
 import os
-
-import wandb 
-
-from kalman_net import KalmanNetNN
-from pipeline import Pipeline_EKF
+import matplotlib.pyplot as plt
+from datetime import datetime
 
 from vehicle_model import VehicleModel
 from data_loader import load_vehicle_dataset
+from pipeline import Pipeline_Vehicle_KNet 
+from kalman_net import KalmanNetNN  
 
+if __name__ == "__main__":
+    
 
-today = datetime.today()
-now = datetime.now()
-strToday = today.strftime("%m.%d.%y")
-strNow = now.strftime("%H-%M-%S") 
-strTime = strToday + "_" + strNow
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    noisy_csv = 'combined_dataset_clean.csv'
+    clean_csv = 'combined_dataset_clean.csv'
+    
 
+    if not os.path.exists(clean_csv):
+        print(f"WARNING: File {clean_csv} not found. Check the path.")
 
-path_results = '/Users/dorianagiovarruscio/Desktop/tesi/codice python/cod_KalmanNet/KNet_Vehicle_Results'
-if not os.path.exists(path_results):
-    os.makedirs(path_results)
+    
+    strTime = datetime.now().strftime("%m%d_%H%M")
+    path_results = f'KNet_TBPTT_Results_{strTime}'
+    
+    m, n = 6, 5         # Number of states and observations
+    Ts = 0.01           # Sampling time
+    T_full = 1200       # Full trajectory length
+    
+    CHUNK_SIZE = 200    # K_TBPTT: Chunk length for backpropagation
+    N_EPOCHS = 500      # Number of Epochs
+    BATCH_SIZE = 64     # Batch Size
+    LR = 1e-4           # Learning Rate
+    WD = 1e-5           # Weight Decay
+    
+    # Training Strategy: 
+    # 'standard'     -> Updates weights every CHUNK_SIZE steps (Faster learning)
+    # 'accumulation' -> Accumulates gradients and updates at end of trajectory (More stable)
+    TRAIN_STRATEGY = 'standard' 
 
+    #  DATA LOADING
+    print("\n Data Loading ")
 
-m = 6 # Dimensione Stato: [X, Y, phi, vx, vy, omega]
-n = 5 # Dimensione Osservazione: [X, Y, vx, vy, omega]
-d = 2 # Dimensione Controllo: [d, delta]
+    try:
+        (train_data, val_data, test_data) = load_vehicle_dataset(
+            noisy_csv, clean_csv, T_steps=T_full, train_split=0.7, val_split=0.15
+        )
+    except Exception as e:
+        print(f"Error loading data: {e}")
+        sys.exit(1)
 
-Ts = 0.02 # Passo di campionamento (12s / 600 steps)
-T = 600   # Lunghezza sequenze di training e validation
-T_test = 600 # Lunghezza sequenze di test
+    y_train_full, u_train_full, x_train_full = train_data
+    print(f"Dataset Loaded. Train shape: {x_train_full.shape}")
 
-noisy_csv = '/Users/dorianagiovarruscio/Desktop/tesi/codice python/cod_KalmanNet/piecewise_mpc_noisy.csv'  
-clean_csv = '/Users/dorianagiovarruscio/Desktop/tesi/codice python/cod_KalmanNet/piecewise_mpc_clean.csv'
+    # PHYSICAL LIMITS EXTRACTION (MIN/MAX)
 
-CompositionLoss = True
+    x_min_val = x_train_full[:, 0, :].min().item()
+    x_max_val = x_train_full[:, 0, :].max().item()
+    y_min_val = x_train_full[:, 1, :].min().item()
+    y_max_val = x_train_full[:, 1, :].max().item()
+    vx_min_val = x_train_full[:, 3, :].min().item()
+    vx_max_val = x_train_full[:, 3, :].max().item()
+    vy_min_val = x_train_full[:, 4, :].min().item()
+    vy_max_val = x_train_full[:, 4, :].max().item()
+    phi_min_val = x_train_full[:, 2, :].min().item()
+    phi_max_val = x_train_full[:, 2, :].max().item()
+    omega_min_val = x_train_full[:, 5, :].min().item()
+    omega_max_val = x_train_full[:, 5, :].max().item()
 
-# Parametri di training
-N_steps = 500 # Numero epoche
-N_batch = 100 # Dimensione del singolo batch
-lr = 5e-6    # Learning rate
-wd = 5e-5     # Weight decay
-alpha = 0.5   # Peso per la Composition Loss
+    
+    print(f"Position X Limits: [{x_min_val:.2f}, {x_max_val:.2f}]")
+    print(f"Position Y Limits: [{y_min_val:.2f}, {y_max_val:.2f}]")
 
-use_cuda = False 
-device = torch.device('cpu')
-print("Using CPU")
+    
+    # NORMALIZATION
+    
+    print(" Calculating Normalization Statistics ")
+    
+    x_mean = torch.mean(x_train_full, dim=(0, 2)).reshape(1, m, 1)
+    x_std  = torch.std(x_train_full, dim=(0, 2)).reshape(1, m, 1) + 1e-8
+    
+    y_mean = torch.mean(y_train_full, dim=(0, 2)).reshape(1, n, 1)
+    y_std  = torch.std(y_train_full, dim=(0, 2)).reshape(1, n, 1) + 1e-8
 
-# Stato iniziale
-m1x_0 = torch.zeros(m, 1) # [6, 1]
-
-# Prior per gli stati nascosti delle GRU di KalmanNet
-prior_Q = torch.eye(m)     # [6, 6]
-prior_Sigma = torch.eye(m) # [6, 6]
-prior_S = torch.eye(n)     # [5, 5]
-
-
-# Modello non lineare
-sys_model = VehicleModel(Ts, T, T_test, m1x_0, prior_Q, prior_Sigma, prior_S)
-
-
-(train_data, val_data, test_data) = load_vehicle_dataset(
-    noisy_csv, 
-    clean_csv, 
-    T_steps=T,
-    train_split=0.7, # 70% training (7000 traiettorie)
-    val_split=0.15   # 15% validation (1500 traiettorie)
-)
-
-
-y_train, u_train, x_train = train_data
-y_val, u_val, x_val = val_data
-y_test, u_test, x_test = test_data
-
-
-train_input = y_train     # Misure rumorose (input)
-train_target = x_train    # Stato pulito (target)
-train_control = u_train   # Controlli (input)
-
-cv_input = y_val
-cv_target = x_val
-cv_control = u_val
-
-
-# Indici: 0:X, 1:Y, 2:phi, 3:vx, 4:vy, 5:omega
-x_min = x_train[:, 0, :].min().item()
-x_max = x_train[:, 0, :].max().item()
-y_min = x_train[:, 1, :].min().item()
-y_max = x_train[:, 1, :].max().item()
-phi_min = x_train[:, 2, :].min().item()
-phi_max = x_train[:, 2, :].max().item()
-vx_min = x_train[:, 3, :].min().item()
-vx_max = x_train[:, 3, :].max().item()
-vy_min = x_train[:, 4, :].min().item()
-vy_max = x_train[:, 4, :].max().item()
-omega_min = x_train[:, 5, :].min().item()
-omega_max = x_train[:, 5, :].max().item()
-
-# Imposta i limiti nel modello di sistema
-sys_model.Params["x_min"] = x_min
-sys_model.Params["x_max"] = x_max
-sys_model.Params["y_min"] = y_min
-sys_model.Params["y_max"] = y_max
-sys_model.Params["phi_min"] = phi_min
-sys_model.Params["phi_max"] = phi_max
-sys_model.Params["vx_min"] = vx_min
-sys_model.Params["vx_max"] = vx_max
-sys_model.Params["vy_min"] = vy_min
-sys_model.Params["vy_max"] = vy_max
-sys_model.Params["omega_min"] = omega_min
-sys_model.Params["omega_max"] = omega_max
-
-print(f"  vx: [{vx_min:.4f}, {vx_max:.4f}]")
-print(f"  vy: [{vy_min:.4f}, {vy_max:.4f}]")
-print(f"  omega: [{omega_min:.4f}, {omega_max:.4f}]")
-
-wandb.init(
-    project="KalmanNet_Vehicle_Tesi",  
-    name =f'KNet_Vehicle_{strTime}',            
-    config={
-        "learning_rate": lr,
-        "weight_decay": wd,
-        "epochs": N_steps,
-        "batch_size": N_batch,
-        "alpha_composition_loss": alpha,
-        "loss_function": "CompositionLoss" if CompositionLoss else "MSELoss",
-        "model_class": "KalmanNetNN",
+    norm_stats = {
+        "x_mean": x_mean.to(device), "x_std": x_std.to(device),
+        "y_mean": y_mean.to(device), "y_std": y_std.to(device)
     }
-)
 
-# KalmanNet Pipeline 
+    # MODEL INITIALIZATION
+    print("\n Model Initialization ")
+    
+    m1x_0 = torch.zeros(m, 1).to(device)
+    sys_model = VehicleModel(Ts, T_full, T_full, m1x_0, torch.eye(m), torch.eye(m), torch.eye(n))
+    
+    knet_model = KalmanNetNN()
+    knet_model.to(device)
+    
+    knet_model.NNBuild(sys_model, in_mult_KNet=10, out_mult_KNet=40, hidden_dim_gru=128)
+    
+    # PIPELINE SETUP
+    print("\n Pipeline Setup ")
+    pipeline = Pipeline_Vehicle_KNet(path_results, "KNet_Vehicle_TBPTT")
+    
+    pipeline.set_models(sys_model, knet_model)
+    pipeline.set_data(train_data, val_data, test_data, norm_stats, device)
+    
+    pipeline.set_training_params(
+        n_steps=N_EPOCHS,
+        n_batch=BATCH_SIZE,
+        lr=LR,
+        wd=WD,
+        K_TBPTT=CHUNK_SIZE,   
+        T=T_full,             
+        training_strategy=TRAIN_STRATEGY, # 'standard' or 'accumulation'
+        CompositionLoss=True, 
+        alpha=0.8             # 0.8 * State_Loss + 0.2 * Observation_Loss
+    )
+    
+    # TRAINING AND TEST
+    print("\n START TRAINING ")
+    pipeline.train()
+    
+    print("\n PLOTTING ")
+    pipeline.plot_learning_curve()
+    
 
-# KalmanNet Model
-KalmanNet_model = KalmanNetNN()
-KalmanNet_model.NNBuild(sys_model) 
-print("Number of trainable parameters for KalmanNet:", sum(p.numel() for p in KalmanNet_model.parameters() if p.requires_grad))
-
-# Pipeline training
-KalmanNet_Pipeline = Pipeline_EKF(strTime, path_results, "KalmanNet_Vehicle")
-KalmanNet_Pipeline.setssModel(sys_model)
-KalmanNet_Pipeline.setModel(KalmanNet_model)
-KalmanNet_Pipeline.setTrainingParams(N_steps, N_batch, lr, wd, alpha=0.5) # alpha per CompositionLoss
-
-
-print(" Training")
-[MSE_cv_linear_epoch, MSE_cv_dB_epoch, MSE_train_linear_epoch, MSE_train_dB_epoch] = \
-    KalmanNet_Pipeline.NNTrain(sys_model, 
-                             cv_input, cv_target, cv_control, 
-                             train_input, train_target, train_control, 
-                             path_results, CompositionLoss, loadModel=False) # loadModel=False per iniziare da zero
-
-KalmanNet_Pipeline.save()
-
-
-pipeline_artifact = wandb.Artifact(f'pipeline-{wandb.run.name}', type='pipeline')
-pipeline_artifact.add_file(KalmanNet_Pipeline.PipelineName) 
-wandb.log_artifact(pipeline_artifact)
-
-print("Plotting learning curve")
-plt.figure()
-plt.plot(range(N_steps), MSE_train_dB_epoch, 'b', label="Training Loss")
-plt.plot(range(N_steps), MSE_cv_dB_epoch, 'g', label="Validation Loss")
-plt.xlabel("Training Epoch")
-plt.ylabel("MSE Loss [dB]")
-plt.legend()
-plt.grid(True)
-plt.title("Curva di Apprendimento KalmanNet - Veicolo")
-plt.savefig(path_results + 'learning_curve.png')
-wandb.log({"Learning Curve": wandb.Image(plt)})
-plt.show()
-plt.close()
-wandb.finish()
+    if hasattr(pipeline, 'plot_trajectories'):
+         print("Generating trajectory plots")
+         pipeline.plot_trajectories(sample_idx=0)
+    
+    print("\n START TEST ")
+    pipeline.test()
+    
+    print(" END SCRIPT ")
