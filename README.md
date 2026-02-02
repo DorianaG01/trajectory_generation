@@ -5,7 +5,7 @@ This repository hosts a comprehensive framework for autonomous vehicle research,
 
 The project integrates physical modeling (Dynamic Bicycle Model) with Deep Learning (KalmanNet) and optimization-based control (MPC). Uniquely, **the MPC controller is used upstream to generate realistic datasets**, ensuring the training data represents physically feasible driving behaviors.
 
-## 📂 Project Structure
+##  Project Structure
 
 The repository is organized into three main modules:
 
@@ -42,7 +42,7 @@ This module contains the mathematical formulation of the **Model Predictive Cont
 
 ---
 
-## 🔄 Workflow
+##  Workflow
 
 The data flows through the system as follows:
 
